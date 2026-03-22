@@ -1,0 +1,1 @@
+After changes, verify by running a syntax check that does not rely on writing `__pycache__` if sandboxing is active, then run a short end-to-end conversion or registration command against a sample asset. For converter changes, also validate the resulting file with ffprobe to confirm HEVC + hvc1 + yuv420p10le + BT.709 tags remain correct.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import struct
 import subprocess
@@ -575,7 +576,7 @@ def run_command(command: list[str]) -> None:
     raise ScriptError(message)
 
 
-def ffprobe_stream(input_path: Path, ffprobe_bin: str) -> dict[str, Any]:
+def ffprobe_data(input_path: Path, ffprobe_bin: str) -> dict[str, Any]:
     command = [
         ffprobe_bin,
         "-v",
@@ -592,11 +593,85 @@ def ffprobe_stream(input_path: Path, ffprobe_bin: str) -> dict[str, Any]:
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip() or "ffprobe failed"
         raise ScriptError(message)
-    data = json.loads(completed.stdout)
+    return json.loads(completed.stdout)
+
+
+def ffprobe_stream(input_path: Path, ffprobe_bin: str) -> dict[str, Any]:
+    data = ffprobe_data(input_path, ffprobe_bin)
     streams = data.get("streams") or []
     if not streams:
         raise ScriptError("No video stream found in input")
     return streams[0]
+
+
+def effective_duration_seconds(probe_data: dict[str, Any], start_time: float | None, end_time: float | None) -> float | None:
+    format_duration = probe_data.get("format", {}).get("duration")
+    if format_duration in (None, "N/A"):
+        return None
+
+    try:
+        source_duration = float(format_duration)
+    except (TypeError, ValueError):
+        return None
+
+    start = start_time or 0.0
+    if end_time is not None:
+        return max(0.0, end_time - start)
+    return max(0.0, source_duration - start)
+
+
+def run_ffmpeg_with_progress(command: list[str], total_duration: float | None) -> None:
+    progress_command = command[:]
+    if len(progress_command) > 1:
+        progress_command[1:1] = ["-progress", "pipe:1", "-nostats"]
+    else:
+        progress_command += ["-progress", "pipe:1", "-nostats"]
+
+    process = subprocess.Popen(
+        progress_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    last_percent = -1
+    progress_lines: dict[str, str] = {}
+
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        progress_lines[key] = value
+
+        if key != "progress":
+            continue
+
+        out_time_us = progress_lines.get("out_time_us")
+        if total_duration and out_time_us and out_time_us.isdigit():
+            current_seconds = int(out_time_us) / 1_000_000.0
+            percent = min(100, max(0, int((current_seconds / total_duration) * 100)))
+            if percent != last_percent:
+                print(f"Transcoding: {percent}%", flush=True)
+                last_percent = percent
+
+        if value == "end" and last_percent < 100:
+            print("Transcoding: 100%", flush=True)
+            last_percent = 100
+
+    stderr_output = ""
+    if process.stderr is not None:
+        stderr_output = process.stderr.read().strip()
+
+    return_code = process.wait()
+    if return_code == 0:
+        if total_duration is None and last_percent < 100:
+            print("Transcoding: done", flush=True)
+        return
+
+    raise ScriptError(stderr_output or "Unknown ffmpeg failure")
 
 
 def parse_ratio(value: str | None) -> float:
@@ -632,7 +707,34 @@ def should_tonemap(stream: dict[str, Any]) -> bool:
     return False
 
 
-def build_filter_chain(stream: dict[str, Any]) -> str:
+_FFMPEG_FILTER_CACHE: dict[str, set[str]] = {}
+
+
+def ffmpeg_available_filters(ffmpeg_bin: str) -> set[str]:
+    cached = _FFMPEG_FILTER_CACHE.get(ffmpeg_bin)
+    if cached is not None:
+        return cached
+
+    completed = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        _FFMPEG_FILTER_CACHE[ffmpeg_bin] = set()
+        return _FFMPEG_FILTER_CACHE[ffmpeg_bin]
+
+    filters: set[str] = set()
+    for line in completed.stdout.splitlines():
+        match = re.match(r"^\s*[TSC\.\|]+\s+([A-Za-z0-9_]+)\s", line)
+        if match:
+            filters.add(match.group(1))
+
+    _FFMPEG_FILTER_CACHE[ffmpeg_bin] = filters
+    return filters
+
+
+def build_filter_chain(stream: dict[str, Any], ffmpeg_bin: str) -> str:
     filters: list[str] = []
 
     frame_rate = parse_ratio(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
@@ -641,6 +743,16 @@ def build_filter_chain(stream: dict[str, Any]) -> str:
         filters.append(f"fps=fps={normalized_fps}")
 
     if should_tonemap(stream):
+        available_filters = ffmpeg_available_filters(ffmpeg_bin)
+        if "zscale" not in available_filters:
+            print(
+                "warning: ffmpeg build does not include the 'zscale' filter; "
+                "falling back to 10-bit conversion without HDR tone-mapping",
+                file=sys.stderr,
+            )
+            filters.append("format=yuv420p10le")
+            return ",".join(filters)
+
         filters.append("zscale=transfer=linear:npl=100")
         filters.append("tonemap=hable")
         filters.append("zscale=transfer=bt709:primaries=bt709:matrix=bt709")
@@ -659,8 +771,10 @@ def transcode_for_live_wallpaper(
     start_time: float | None,
     end_time: float | None,
 ) -> None:
-    stream = ffprobe_stream(input_path, ffprobe_bin)
-    filter_chain = build_filter_chain(stream)
+    probe_data = ffprobe_data(input_path, ffprobe_bin)
+    stream = probe_data["streams"][0]
+    total_duration = effective_duration_seconds(probe_data, start_time, end_time)
+    filter_chain = build_filter_chain(stream, ffmpeg_bin)
 
     command = [
         ffmpeg_bin,
@@ -713,7 +827,7 @@ def transcode_for_live_wallpaper(
         "240000",
         str(temp_output),
     ]
-    run_command(command)
+    run_ffmpeg_with_progress(command, total_duration)
 
 
 def process_video(

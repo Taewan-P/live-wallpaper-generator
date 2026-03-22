@@ -6,8 +6,10 @@ import json
 import mimetypes
 import os
 import plistlib
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -107,7 +109,13 @@ def run_command(command: list[str]) -> None:
     if completed.returncode == 0:
         return
     message = completed.stderr.strip() or completed.stdout.strip() or "Subprocess failed"
-    raise WallpaperApplyError(message)
+    raise WallpaperApplyError(f"{shlex.join(command)} failed: {message}")
+
+
+def run_command_capture(command: list[str]) -> tuple[int, str]:
+    completed = subprocess.run(command, capture_output=True, text=True)
+    message = completed.stderr.strip() or completed.stdout.strip()
+    return completed.returncode, message
 
 
 def backup_if_missing(path: Path) -> None:
@@ -383,17 +391,27 @@ def apply_asset(paths: WallpaperPaths, asset_id: str) -> None:
     write_index(paths, index_data)
 
 
-def restart_wallpaper_agent() -> None:
-    run_command(["/bin/launchctl", "stop", "com.apple.wallpaper.agent"])
-    completed = subprocess.run(
-        ["/usr/bin/pkill", "-f", "WallpaperAgent|WallpaperAerialsExtension|NeptuneOneWallpaper"],
-        capture_output=True,
-        text=True,
+def restart_wallpaper_agent() -> bool:
+    warnings: list[str] = []
+
+    stop_code, stop_message = run_command_capture(["/bin/launchctl", "stop", "com.apple.wallpaper.agent"])
+    if stop_code != 0:
+        warnings.append(f"could not stop wallpaper agent automatically: {stop_message or f'exit {stop_code}'}")
+
+    pkill_code, pkill_message = run_command_capture(
+        ["/usr/bin/pkill", "-f", "WallpaperAgent|WallpaperAerialsExtension|NeptuneOneWallpaper"]
     )
-    if completed.returncode not in (0, 1):
-        message = completed.stderr.strip() or completed.stdout.strip() or "pkill failed"
-        raise WallpaperApplyError(message)
-    run_command(["/bin/launchctl", "start", "com.apple.wallpaper.agent"])
+    if pkill_code not in (0, 1, 3):
+        warnings.append(f"could not kill wallpaper helper processes automatically: {pkill_message or f'exit {pkill_code}'}")
+
+    start_code, start_message = run_command_capture(["/bin/launchctl", "start", "com.apple.wallpaper.agent"])
+    if start_code != 0:
+        warnings.append(f"could not start wallpaper agent automatically: {start_message or f'exit {start_code}'}")
+
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    return not warnings
 
 
 class LocalAssetRequestHandler(BaseHTTPRequestHandler):
@@ -485,6 +503,14 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def is_local_server_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def background_server_status() -> tuple[int | None, bool]:
     pid = read_server_pid()
     if pid is None:
@@ -521,17 +547,23 @@ def ensure_localhost_server_running(paths: WallpaperPaths, public_base_url: str,
         return None
 
     pid, alive = background_server_status()
-    if alive:
+    _, port = localhost_target
+
+    if alive and is_local_server_reachable(DEFAULT_HOST, port):
         return pid
 
-    _, port = localhost_target
+    if pid is not None and not is_local_server_reachable(DEFAULT_HOST, port):
+        server_pid_path().unlink(missing_ok=True)
+
     return start_background_server(paths, DEFAULT_HOST, port, python_bin)
 
 
 def start_background_server(paths: WallpaperPaths, host: str, port: int, python_bin: str) -> int:
     pid, alive = background_server_status()
-    if alive and pid is not None:
+    if alive and pid is not None and is_local_server_reachable(host, port):
         raise WallpaperApplyError(f"Background server is already running with PID {pid}")
+    if pid is not None and not is_local_server_reachable(host, port):
+        server_pid_path().unlink(missing_ok=True)
 
     server_state_dir().mkdir(parents=True, exist_ok=True)
     server_stdout_log_path().parent.mkdir(parents=True, exist_ok=True)
@@ -671,6 +703,90 @@ def list_custom_assets(paths: WallpaperPaths) -> list[dict[str, Any]]:
     return results
 
 
+def find_asset_by_id(paths: WallpaperPaths, asset_id: str) -> dict[str, Any] | None:
+    manifest = read_manifest(paths)
+    for asset in manifest.get("assets", []):
+        if asset.get("id") == asset_id:
+            return asset
+    return None
+
+
+def latest_localhost_asset(paths: WallpaperPaths) -> dict[str, Any] | None:
+    manifest = read_manifest(paths)
+    localhost_assets = [
+        asset
+        for asset in manifest.get("assets", [])
+        if "localhost" in (asset.get("url-4K-SDR-240FPS") or "") or "127.0.0.1" in (asset.get("url-4K-SDR-240FPS") or "")
+    ]
+    if not localhost_assets:
+        return None
+    return localhost_assets[-1]
+
+
+def collect_applied_asset_ids(index_data: dict[str, Any]) -> list[str]:
+    applied: list[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            content = obj.get("Content")
+            if isinstance(content, dict):
+                choices = content.get("Choices") or []
+                if choices and isinstance(choices[0], dict):
+                    provider = choices[0].get("Provider")
+                    config = choices[0].get("Configuration")
+                    if provider == "com.apple.wallpaper.choice.aerials" and isinstance(config, (bytes, bytearray)):
+                        try:
+                            asset_id = plistlib.loads(config).get("assetID")
+                        except Exception:
+                            asset_id = None
+                        if isinstance(asset_id, str):
+                            applied.append(asset_id)
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    walk(index_data)
+    return applied
+
+
+def doctor(paths: WallpaperPaths, asset_id: str | None) -> int:
+    asset = find_asset_by_id(paths, asset_id) if asset_id else latest_localhost_asset(paths)
+    if asset is None:
+        print("doctor: no localhost-backed custom asset found")
+        return 1
+
+    chosen_asset_id = asset["id"]
+    video_path = paths.videos_dir / f"{chosen_asset_id}.mov"
+    thumb_path = paths.thumbnails_dir / f"{chosen_asset_id}.png"
+    video_url = asset.get("url-4K-SDR-240FPS") or ""
+    thumb_url = asset.get("previewImage") or ""
+    localhost_target = parse_localhost_base_url(video_url)
+
+    print(f"asset_id: {chosen_asset_id}")
+    print(f"name: {asset.get('accessibilityLabel')}")
+    print(f"manifest_video_url: {video_url}")
+    print(f"manifest_thumb_url: {thumb_url}")
+    print(f"video_file_exists: {video_path.exists()} ({video_path})")
+    print(f"thumbnail_file_exists: {thumb_path.exists()} ({thumb_path})")
+
+    pid, alive = background_server_status()
+    print(f"background_server_pid: {pid}")
+    print(f"background_server_alive: {alive}")
+
+    if localhost_target is not None:
+        _, port = localhost_target
+        reachable = is_local_server_reachable(DEFAULT_HOST, port)
+        print(f"localhost_port_reachable: {reachable} ({DEFAULT_HOST}:{port})")
+
+    index_data = load_index(paths)
+    applied_asset_ids = collect_applied_asset_ids(index_data)
+    print(f"applied_aerial_asset_ids: {applied_asset_ids}")
+    print(f"asset_is_applied: {chosen_asset_id in applied_asset_ids}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Register and apply a patched live-wallpaper video using localhost-backed asset URLs.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -712,6 +828,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="List localhost-backed custom wallpaper assets")
     list_parser.add_argument("--wallpaper-root", type=Path, default=None)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Inspect registration, server health, and apply state for a localhost-backed wallpaper asset")
+    doctor_parser.add_argument("--asset-id", default=None, help="Specific asset ID to inspect; defaults to the latest localhost-backed asset")
+    doctor_parser.add_argument("--wallpaper-root", type=Path, default=None)
 
     return parser
 
@@ -791,6 +911,9 @@ def main() -> int:
             for item in list_custom_assets(resolve_paths(args.wallpaper_root)):
                 print(json.dumps(item, ensure_ascii=False))
             return 0
+
+        if args.command == "doctor":
+            return doctor(resolve_paths(args.wallpaper_root), args.asset_id)
 
         raise WallpaperApplyError(f"Unknown command: {args.command}")
     except WallpaperApplyError as exc:
